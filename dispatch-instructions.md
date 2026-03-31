@@ -114,13 +114,11 @@ dispatch 完成后，将本次执行结果追加到 `~/clawd/memory/dispatch-log
 ⚡ 用 `read` 先读现有内容，然后 `write` 追加（保留历史记录）。如果文件超过 50 条记录，删除最早的记录只保留最近 30 条。
 
 ## 群名与 chat_id 映射（兜底）
-优先从摘要的 `<!-- chat:oc_xxx -->` 注释解析。以下映射仅在注释缺失时兜底使用。
+优先从摘要的 `<!-- chat:oc_xxx -->` 注释解析。如果注释缺失，读取本地映射文件兜底：
 
-**⚠️ 此表需要你自己填入真实 chat_id。格式示例：**
 ```
-- 项目讨论群 → oc_your_chat_id_here
-- 技术实验室 → oc_another_chat_id
+read(file="~/clawd/skills/deepsleep/chat-id-mapping.local.md")
 ```
 
-从 `sessions_list` 的 session key 中提取 chat_id：
+如果本地映射文件也不存在，从 `sessions_list` 的 session key 中提取：
 `agent:main:feishu:group:oc_abc123` → chat_id 是 `oc_abc123`

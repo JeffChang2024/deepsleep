@@ -1,6 +1,9 @@
 # Archived dead code contains hardcoded chat_ids — exclude from public repo
 references/archived/
 
+# Local config with real chat_ids
+*.local.md
+
 # Runtime data
 memory/
 *.log
