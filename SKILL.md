@@ -18,13 +18,14 @@ Activate when user mentions daily summary, memory persistence, sleep cycle, cros
 ### Phase 1: Deep Sleep Pack (23:40)
 
 1. **Auto-discover sessions** — Use `sessions_list(kinds=['group', 'main'], activeMinutes=1440)` to find all active groups AND direct messages from the past 24 hours. New groups are automatically included.
-2. **Pull conversation history** — For each active session, use `sessions_history(sessionKey=<key>, limit=100)`.
-3. **Filter and summarize** — Apply filtering criteria to generate concise summaries:
+2. **Silent Day Carry-Forward** — If no active sessions are found (or none have real user messages), this is a "silent day". Instead of skipping, carry forward Open Questions, unfinished todos, and action items from the most recent active daily file (search back up to 7 days). Mark progress entries as "延续自 YYYY-MM-DD". This prevents multi-day silence from causing memory loss through rolling-window expiration.
+3. **Pull conversation history** — For each active session, use `sessions_history(sessionKey=<key>, limit=100)`.
+4. **Filter and summarize** — Apply filtering criteria to generate concise summaries:
    - Keep: Decisions, Lessons, Preferences, Relationships, Milestones
    - Skip: Transient (heartbeats, weather), Already captured in MEMORY.md
-4. **Schedule future items** — Extract future-dated reminders and write to `memory/schedule.md` with trigger dates.
-5. **Write daily file (idempotent)** — Write the `## Daily Summary (DeepSleep)` section to `memory/YYYY-MM-DD.md`. Before writing, check if a `## Daily Summary (DeepSleep)` header already exists for today — if so, replace it instead of appending a duplicate. This ensures retries and re-runs produce the same result.
-6. **Update long-term memory (privacy-safe)** — Merge-update `MEMORY.md` (update in place, don't append duplicates; remove outdated info). **Important:** Do NOT copy private MEMORY.md content into the daily summary file. The daily file may be broadcast to groups in Phase 2 — only include information that originated from those groups' own conversations.
+5. **Schedule future items** — Extract future-dated reminders and write to `memory/schedule.md` with trigger dates.
+6. **Write daily file (idempotent)** — Write the `## Daily Summary (DeepSleep)` section to `memory/YYYY-MM-DD.md`. Before writing, check if a `## Daily Summary (DeepSleep)` header already exists for today — if so, replace it instead of appending a duplicate. This ensures retries and re-runs produce the same result.
+7. **Update long-term memory (privacy-safe)** — Merge-update `MEMORY.md` (update in place, don't append duplicates; remove outdated info). **Important:** Do NOT copy private MEMORY.md content into the daily summary file. The daily file may be broadcast to groups in Phase 2 — only include information that originated from those groups' own conversations.
 
 ### Phase 2: Morning Dispatch (00:10)
 
@@ -185,9 +186,10 @@ Phase 2 generates/updates these files each morning. They are compact (< 2KB each
 11. **Midnight race condition**: Pack starts at 23:40 and may cross midnight. Lock the target date at script start (23:xx→today, 00:xx→yesterday) and never re-fetch current time in later steps. All filenames and headers use this locked `PACK_DATE`.
 12. **Dispatch deduplication**: Use `memory/dispatch-lock.md` (contains one line: the dispatched date). Check before sending; write after all sends complete. If lock date matches target date, skip entirely. Lock must be written AFTER sends (not before) so a crash mid-send allows retry.
 13. **Schedule ItemKey dedup**: `memory/schedule.md` has a `Key` column as unique identifier. Pack must check existing keys before writing; update status if key exists, only append if new.
-14. **Snapshot 3-day rolling merge**: Keep last 3 days of progress entries. Open Questions and incomplete todos survive beyond 3 days. Completed todos older than 3 days are pruned.
+14. **Snapshot rolling merge with silent-day protection**: Keep last 3 days of **active** progress entries. Silent-day carry-forward entries (marked "延续自") are exempt from the 3-day window and persist until replaced by active content or their linked Open Questions / todos resolve. Open Questions and incomplete todos survive indefinitely. Completed todos older than 3 days are pruned.
 15. **MEMORY.md guard rails**: Pack may only append/update — never delete existing sections, rewrite About/Channels/Lessons, or restructure the file. Humans own the structure; agents own incremental updates.
 16. **DM privacy boundary**: Daily summary is broadcast material. DM content stays in MEMORY.md only. Open Questions and Today sections must not contain DM-originated items. Write "N DMs processed" summary, not details.
+17. **Silent Day Carry-Forward**: If no active sessions exist during pack, do NOT skip. Carry forward Open Questions, unfinished todos, and action items from the most recent daily file (search back up to 7 days). Mark carried entries as "延续自 YYYY-MM-DD". Without this, consecutive silent days cause the 3-day rolling merge to expire all entries, resulting in total memory loss after 3+ days of inactivity. Silent-day carry-forward entries are exempt from the 3-day rolling window — they persist until replaced by new active content or their associated Open Questions / todos are resolved.
 
 ## Verification Checklist
 

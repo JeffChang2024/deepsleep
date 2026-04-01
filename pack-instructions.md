@@ -18,6 +18,42 @@ Pack 在 23:40 启动，正常应在 ~00:00 前完成，但如果执行较慢可
 用 `sessions_list(kinds=['group', 'main'], activeMinutes=1440, messageLimit=1)` 获取过去24小时活跃的群和主 session。
 记下每个 session 的 key 和 displayName。
 
+### 🔇 静默日检测（Silent Day Carry-Forward）
+**如果 sessions_list 返回为空（或所有 session 都没有真实用户消息），这是一个"静默日"。**
+
+静默日不能跳过！必须执行 carry-forward：
+1. 读取**昨天**的 daily file `memory/<PACK_DATE 前一天>.md`，找到 `## DeepSleep Daily Summary` 段落
+2. 如果昨天也没有（连续静默），向前追溯最多 **7 天**，找到最近一个有 `## DeepSleep Daily Summary` 的 daily file
+3. 从找到的最近摘要中提取：
+   - 所有 `### 🔮 Open Questions` → **原封不动保留**
+   - 所有 `### 📋 Today (Next Day)` 中**未完成**的条目 → 保留
+   - 所有 `### 待办` 中 `- [ ]` 未勾选条目 → 保留
+   - 各群进展 → 标记为 `（延续自 YYYY-MM-DD，当日无新对话）`
+4. 生成静默日摘要，**跳过第1-2步**，直接进入第4步写入
+
+静默日摘要模板：
+```markdown
+## DeepSleep Daily Summary
+
+> 静默日（过去24h无活跃对话）。延续自 YYYY-MM-DD 的未完成事项。
+
+### [群名] <!-- chat:oc_xxx -->
+- （当日无新对话，延续自 YYYY-MM-DD）
+
+### 🔮 Open Questions
+- [原封不动搬运]
+
+### 📋 Today (Next Day)
+- [搬运昨天未完成的行动项]
+
+### 待办
+- [ ] [搬运未完成待办]
+```
+
+⚠️ **这一步是防止连续静默天导致记忆断裂的关键**。没有它，3天不说话 = 快照过期 = 滚动合并误杀所有条目。
+
+**如果有活跃 session**，正常继续第1步。
+
 ## 第1步：批量拉取对话历史
 对每个活跃 session 用 `sessions_history(sessionKey=<key>, limit=50)` 拉取对话。
 ⚡ **关键优化**：尽可能在同一个 tool call batch 中并行拉取多个 session 的历史（OpenClaw 支持同时发起多个 sessions_history 调用）。不要一个一个串行拉取！
@@ -28,6 +64,7 @@ Pack 在 23:40 启动，正常应在 ~00:00 前完成，但如果执行较慢可
 - ❌ 临时内容（天气、心跳、例行操作）、MEMORY.md 中已有的 → 跳过
 
 如果某个群今天完全没有用户消息（只有系统/心跳），跳过该群。
+但是！**不要跳过有未解决 Open Questions 或未完成待办的群**——即使今天没有新对话，这些群仍需出现在摘要中以保持连续性（参见第0步静默日逻辑）。
 
 ## 第3步：Schedule 远期记忆
 对话中提到的远期事项写入 `~/clawd/memory/schedule.md`。
