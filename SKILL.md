@@ -1,227 +1,316 @@
 ---
 name: deepsleep
-description: Two-phase daily memory persistence for AI agents. Nightly pack at 23:40 plus morning dispatch at 00:10. Auto-discovers sessions, filters by importance, tracks open questions, and delivers per-group morning briefs.
+description: "Two-phase daily memory persistence for AI agents. v3.0: unified pack+dispatch cron, smart silence handling, memory importance tiers, cross-group correlation, OQ health tracking, and schedule priority system."
 ---
 
-# DeepSleep
+# DeepSleep v3.0
 
 Two-phase daily memory persistence for AI agents.
 
 Like humans need sleep for memory consolidation, AI agents need DeepSleep to persist context across sessions.
 
+## What's New in v3.0
+
+| Change | Impact |
+|---|---|
+| 🔴 **Unified pack+dispatch cron** | Single 23:50 job replaces two separate crons. Saves ~2-3万 token/day in cron startup overhead |
+| 🔴 **Silent day fast path** | Skips history pull on silent days. Saves ~5-8万 token/day when nothing happened |
+| 🔴 **Smart晨报 delivery** | Only sends morning briefs when there's real content, P0 due items, or stale OQs. Eliminates noise |
+| 🟡 **Memory importance tiers** | 🔴P0/🟡P1/🟢P2 per entry. Different retention windows (7/5/3 days). Phase 3 loads P0+P1 first |
+| 🟡 **Cross-group correlation** | Detects related topics across groups. "视频训练实验室 ↔ 千问微调实验室: both discussing Qwen-VL" |
+| 🟡 **OQ health tracking** | Tracks age of each Open Question. ⚠️ at 7d, escalation at 14d, archive at 30d |
+| 🟡 **Schedule priority + reminders** | P0/P1/P2 priorities with differentiated reminder frequency. P0 overdue = daily nag |
+| 🟢 **dispatch_policy flag** | Pack sets `active`/`silent` in daily file header; dispatch reads it to decide behavior |
+| 🟢 **Memory quality audit** | Weekly self-audit: compare raw conversation vs summary to catch missed info |
+
 ## When to Activate
 
 Activate when user mentions daily summary, memory persistence, sleep cycle, cross-session memory, morning brief, or nightly pack.
 
+## Architecture
+
+```
+23:50  cron "deepsleep" (single unified job)
+         │
+         ├── PACK PHASE
+         │   ├── Lock date (midnight race protection)
+         │   ├── sessions_list → detect active/silent
+         │   │
+         │   ├── [ACTIVE DAY]
+         │   │   ├── sessions_history (parallel batch)
+         │   │   ├── Filter + summarize with importance tiers
+         │   │   ├── Cross-group correlation detection
+         │   │   ├── OQ health check (age tracking)
+         │   │   ├── Schedule update (priority + dedup)
+         │   │   └── Write daily file (dispatch_policy: active)
+         │   │
+         │   ├── [SILENT DAY — fast path, <5000 tokens]
+         │   │   ├── Read recent daily file
+         │   │   ├── Carry-forward with decay
+         │   │   └── Write daily file (dispatch_policy: silent)
+         │   │
+         │   └── Update MEMORY.md (P0 only, guard rails)
+         │
+         └── DISPATCH PHASE (same session, skip re-read)
+             ├── Dedup check (dispatch-lock.md)
+             ├── Smart send decision per group
+             ├── Send morning briefs (active groups only)
+             ├── Schedule due-date reminders
+             ├── Write per-group snapshots (tiered retention)
+             ├── Write dispatch log
+             └── Write dispatch lock
+
+On-demand  Phase 3: Session Memory Restore
+             ├── Load memory/groups/<chat_id>.md
+             ├── Priority: load 🔴P0 + 🟡P1 first
+             ├── Check cross-group correlations
+             └── Check schedule.md for P0 due items
+```
+
 ## Phases
 
-### Phase 1: Deep Sleep Pack (23:40)
+### Phase 1: Deep Sleep Pack (23:50)
 
-1. **Auto-discover sessions** — Use `sessions_list(kinds=['group', 'main'], activeMinutes=1440)` to find all active groups AND direct messages from the past 24 hours. New groups are automatically included.
-2. **Silent Day Carry-Forward** — If no active sessions are found (or none have real user messages), this is a "silent day". Instead of skipping, carry forward Open Questions, unfinished todos, and action items from the most recent active daily file (search back up to 7 days). Mark progress entries as "延续自 YYYY-MM-DD". This prevents multi-day silence from causing memory loss through rolling-window expiration.
-3. **Pull conversation history** — For each active session, use `sessions_history(sessionKey=<key>, limit=100)`.
-4. **Filter and summarize** — Apply filtering criteria to generate concise summaries:
-   - Keep: Decisions, Lessons, Preferences, Relationships, Milestones
-   - Skip: Transient (heartbeats, weather), Already captured in MEMORY.md
-5. **Schedule future items** — Extract future-dated reminders and write to `memory/schedule.md` with trigger dates.
-6. **Write daily file (idempotent)** — Write the `## Daily Summary (DeepSleep)` section to `memory/YYYY-MM-DD.md`. Before writing, check if a `## Daily Summary (DeepSleep)` header already exists for today — if so, replace it instead of appending a duplicate. This ensures retries and re-runs produce the same result.
-7. **Update long-term memory (privacy-safe)** — Merge-update `MEMORY.md` (update in place, don't append duplicates; remove outdated info). **Important:** Do NOT copy private MEMORY.md content into the daily summary file. The daily file may be broadcast to groups in Phase 2 — only include information that originated from those groups' own conversations.
+1. **Lock date** — Prevent midnight race condition
+2. **Auto-discover sessions** — `sessions_list(kinds=['group', 'main'], activeMinutes=1440)`
+3. **Silent day detection** — If no real user messages, enter fast path (no history pull, <5000 tokens)
+4. **Silent Day Carry-Forward with Decay** — 4-tier decay: Days 1-3 full, 4-7 slim, 8-14 minimal, 15+ archive to MEMORY.md
+5. **[Active day] Pull conversation history** — Parallel batch `sessions_history`
+6. **Filter and summarize with importance tiers** — 🔴P0 strategic, 🟡P1 important, 🟢P2 routine
+7. **Cross-group correlation** — Detect related topics across groups
+8. **OQ health check** — Track age, warn at 7d, escalate at 14d, archive at 30d
+9. **Schedule update** — With P0/P1/P2 priorities, key-based dedup
+10. **Write daily file** — Idempotent, with `dispatch_policy` flag and importance tiers
+11. **Self-check** — Validate chat_id annotations, importance tags, OQ dates
+12. **Update MEMORY.md** — Only for P0 items, with guard rails
 
-### Phase 2: Morning Dispatch (00:10)
+### Phase 2: Morning Dispatch (same session, immediately after pack)
 
-1. **Read yesterday's summary** — Load `memory/YYYY-MM-DD.md` from the previous day.
-2. **Send per-group briefs** — For each group with content, send a personalized morning recap via `message(action='send', target='chat:<id>')`. Only include information from that specific group's summary — never cross-leak content between groups or from MEMORY.md.
-3. **Include reminders** — Attach any schedule items due today.
-4. **Track open questions** — Include relevant Open Questions for continuity.
+1. **Dedup check** — `dispatch-lock.md` prevents double-sending
+2. **Failure recovery** — If pack somehow failed, do emergency mini-pack
+3. **Read daily file** — Already in context from pack (skip re-read in unified mode)
+4. **Check dispatch_policy** — `active` = send briefs; `silent` = update snapshots only
+5. **Smart send decision** — Per-group: send only if new content, P0 due items, or stale OQs
+6. **Send per-group briefs** — With importance-highlighted summaries, cross-group hints, OQ warnings
+7. **Schedule reminders** — P0 due/overdue = 🔥 in brief; P1 due = mention; P2 = summary only
+8. **Write per-group snapshots** — Tiered retention: 🔴7d, 🟡5d, 🟢3d. OQs and todos never expire
+9. **Write dispatch log** — Including send/skip counts and policy
+10. **Write dispatch lock**
+
+### Phase 3: Session Memory Restore (on demand)
+
+When the agent receives a message in a group:
+
+1. Check `memory/groups/<chat_id>.md` — load if exists
+2. **Priority loading** — If token budget is tight, load 🔴+🟡 entries first, skip 🟢
+3. Check cross-group correlations — If this group has related groups, note it
+4. Check `memory/schedule.md` — Any P0 items due today? Proactively mention them
+5. If snapshot missing/stale (>48h) — Fall back to `memory/YYYY-MM-DD.md`
+
+### Phase 4: Memory Quality Audit (weekly, optional)
+
+Once a week (suggest: Sunday heartbeat or dedicated cron), self-audit pack quality:
+
+1. Pick 2-3 random groups from the past week
+2. Pull raw `sessions_history` for those groups
+3. Compare raw conversation vs the daily summary that was generated
+4. Check for:
+   - **Missed important info** — Decisions or lessons that didn't make it into the summary
+   - **Over-compression** — Context that was lost in summarization
+   - **Misclassification** — Items marked P2 that should have been P1/P0
+   - **OQ staleness** — Questions that resolved in conversation but weren't marked done
+5. Write audit findings to `memory/audit-log.md`
+6. If patterns emerge (e.g., consistently missing technical decisions), update filtering criteria in pack-instructions.md
 
 ## Daily Summary Template
 
-**⚠️ The section header must be exactly `## DeepSleep Daily Summary` — both pack and dispatch use this as the anchor for idempotent writes and existence checks. Do not vary this.**
-
 ```markdown
 ## DeepSleep Daily Summary
+<!-- dispatch_policy: active|silent -->
+<!-- pack_version: 3.0 -->
+<!-- silent_days: N (only if silent) -->
 
-> Auto-discovered N active groups. schedule.md: [items due / none].
+> Auto-discovered N active groups (24h). schedule.md: [items due / none].
 
 ### [Group Name] <!-- chat:oc_abc123 -->
-- Concise summary of key discussions and decisions
+- 🔴 Strategic decision summary
+- 🟡 Important progress
+- 🟢 Routine note
 
-### [Another Group] <!-- chat:oc_def456 -->
-- Summary
+### 🔗 Cross-Group Correlations (if any)
+- GroupA ↔ GroupB: related topic description
 
 ### Direct Messages
-- (DM content if any)
+- N DMs processed (no details — privacy)
 
-### Open Questions
-- Unresolved questions, tracked across days
+### 🔮 Open Questions
+- Question [since: MM-DD, pending N days]
+- ⚠️ Question [since: MM-DD, pending 14 days — escalate or shelve]
 
-### Today (Next Day)
-- Actionable next steps (from the reader's perspective at 00:10, these are "today's" tasks)
+### 📋 Today (Next Day)
+- Action items (reader perspective)
+- 🔥 P0 due: [schedule item]
 
 ### Todo
 - [ ] Immediate action items
 ```
-
-**Rules:**
-1. Each group `###` header MUST include `<!-- chat:oc_xxx -->` HTML comment with chat_id.
-2. Pack must self-check: every group section has a parseable chat_id; if missing, flag error.
-3. Dispatch parses chat_ids from these annotations; fallback mapping table is last resort only.
 
 ## Schedule File Format
 
 File: `memory/schedule.md`
 
 ```markdown
-| Date | Source | Item | Status |
-|------|--------|------|--------|
-| YYYY-MM-DD | Group/DM | Description | pending/done |
+| Key | Date | Source | Item | Priority | Status |
+|-----|------|--------|------|----------|--------|
+| ds-v30 | 2026-04-04 | DeepSleep实验室 | DeepSleep v3.0 验证 | P0 | pending |
+```
+
+**Priority levels:**
+- **P0** — Must complete on due date. Reminded in morning brief + Phase 3. Overdue = daily nag
+- **P1** — Important, mentioned in morning brief on due date
+- **P2** — Low priority, noted in daily summary only
+
+## Per-Group Snapshot Format
+
+File: `memory/groups/<chat_id>.md`
+
+```markdown
+# [Group Name] 近期记忆
+> 更新时间：YYYY-MM-DD HH:MM
+> 连续静默 N 天，最后活跃：YYYY-MM-DD (only if silent)
+
+## 最近进展
+- 🔴 [YYYY-MM-DD] Strategic item (retained 7 days)
+- 🟡 [YYYY-MM-DD] Important item (retained 5 days)
+- 🟢 [YYYY-MM-DD] Routine item (retained 3 days)
+
+## 🔮 Open Questions
+- Question [since: MM-DD, pending N days]
+
+## 📋 Todo
+- [ ] Incomplete (never expires)
+- [x] Completed (pruned after 3 days)
+
+## 🔗 Related Groups
+- ↔ [Related Group]: topic description
 ```
 
 ## Setup
 
-### 1. Create cron jobs
+### 1. Create unified cron job (v3.0: single job)
 
 ```bash
-# Phase 1: Pack (needs ~60s per active session for history pull + summarization)
+# v3.0: Single unified pack+dispatch job at 23:50
 openclaw cron add \
-  --name "deepsleep-pack" \
-  --cron "40 23 * * *" \
+  --name "deepsleep" \
+  --cron "50 23 * * *" \
   --tz "Your/Timezone" \
   --session isolated \
-  --message "Execute DeepSleep Phase 1. Read the deepsleep skill pack-instructions.md and follow it strictly." \
-  --timeout-seconds 900 \
-  --no-deliver
-
-# Phase 2: Dispatch (needs time to send messages + write snapshots)
-openclaw cron add \
-  --name "deepsleep-dispatch" \
-  --cron "10 0 * * *" \
-  --tz "Your/Timezone" \
-  --session isolated \
-  --message "Execute DeepSleep Phase 2. Read the deepsleep skill dispatch-instructions.md and follow it strictly." \
+  --message "Execute DeepSleep v3.0. Read the deepsleep skill pack-instructions.md and follow it strictly. After pack completes, continue with dispatch (pack-instructions.md Step 6)." \
   --timeout-seconds 900 \
   --no-deliver
 ```
 
-**⚠️ Must use `--session isolated` (not `--session main`)!** The `timeoutSeconds` field only works with isolated `agentTurn` jobs. Main session `systemEvent` jobs ignore the timeout setting and use the hardcoded heartbeat timeout (~120s), which is far too short. Use `--no-deliver` since the dispatch phase sends messages directly via the message tool.
+**⚠️ Migration from v2.x:** If you have two separate cron jobs (deepsleep-pack and deepsleep-dispatch), remove them and create the single unified job above:
+```bash
+openclaw cron remove <pack-job-id>
+openclaw cron remove <dispatch-job-id>
+openclaw cron add ...  # the unified job above
+```
 
-**Timeout guidance:** Phase 1 needs ~20s per active session (history pull + LLM summarization). For 6 sessions, real-world pack takes ~135s. We recommend 900s (15 min) as a safe default to handle growth.
+### 2. Optional: Weekly audit cron
 
-### 2. Enable cross-session visibility
+```bash
+openclaw cron add \
+  --name "deepsleep-audit" \
+  --cron "0 10 * * 0" \
+  --tz "Your/Timezone" \
+  --session isolated \
+  --message "Execute DeepSleep Phase 4 memory quality audit. Read deepsleep SKILL.md Phase 4 section." \
+  --timeout-seconds 600 \
+  --no-deliver
+```
+
+### 3. Enable cross-session visibility
 
 ```bash
 openclaw config set tools.sessions.visibility all
 openclaw gateway restart
 ```
 
-### 3. Initialize schedule
+### 4. Initialize schedule
 
-Create `memory/schedule.md` with the table header above.
+Create `memory/schedule.md` with the table header.
+
+### 5. Add Phase 3 restore to AGENTS.md
+
+See Phase 3 section above for the standing order template.
 
 ## Requirements
 
 - OpenClaw with `tools.sessions.visibility` set to `all`
-- Cron jobs using `agentTurn` mode (`--session isolated`) with `--timeout-seconds 900`
-- `--no-deliver` on both cron jobs (dispatch sends messages directly via message tool)
-
-## Phase 3: Session Memory Restore (on demand)
-
-The most critical piece — when the agent receives a message in a group session:
-
-1. Check if `memory/groups/<chat_id>.md` exists
-2. If yes, read it to restore context about recent discussions, open questions, and todos
-3. If the file is missing or older than 48 hours, fall back to reading `memory/YYYY-MM-DD.md` (today + yesterday) for that group's section
-
-Without this step, Phases 1-2 only help the human (morning brief), but the agent itself still wakes up with no memory.
-
-### AGENTS.md Configuration
-
-Add this standing order to your `AGENTS.md`:
-
-```markdown
-### 🔄 Standing Order: Group Memory Restore (DeepSleep Phase 3)
-**Trigger:** Before replying in any group chat session
-**Steps:**
-1. Check if `memory/groups/<current_chat_id>.md` exists
-2. If yes → read it (< 2KB, fast load)
-3. If no → read `memory/YYYY-MM-DD.md` (today + yesterday), find that group's section
-4. Check `memory/schedule.md` for today's due items
-5. Reply with restored context
-
-**When required:**
-- Your context has no recent conversation for this group
-- Session just started or was reset
-- You have no memory of what was discussed yesterday
-```
-
-### File structure
-```
-memory/groups/
-├── oc_abc123.md    # Group A: recent 3-day summary + open questions
-├── oc_def456.md    # Group B: recent 3-day summary + open questions
-└── ...
-```
-
-Phase 2 generates/updates these files each morning. They are compact (< 2KB each) and designed for fast loading.
+- Single cron job using `agentTurn` mode (`--session isolated`) with `--timeout-seconds 900`
+- `--no-deliver` on cron job (dispatch sends messages directly via message tool)
 
 ## Privacy Notes
 
-- Phase 1 writes a daily summary that Phase 2 broadcasts to groups. Never include private MEMORY.md content in the daily summary.
-- Each group only receives its own summary in the morning dispatch — no cross-group content leakage.
-- MEMORY.md is updated separately and stays in the main session context only.
-- Per-group memory snapshots only contain that group's own conversation summaries.
+- Pack writes a daily summary that dispatch may broadcast to groups. Never include private MEMORY.md content.
+- Each group only receives its own summary — no cross-group content leakage.
+- Cross-group correlations mention only the topic connection, never specific conversation content from another group.
+- MEMORY.md is updated separately and stays in the main session only.
+- Per-group snapshots only contain that group's own conversation summaries.
+- DM content: only "N DMs processed" in daily summary; details go to MEMORY.md only.
 
 ## Known Gotchas
 
-1. **Cron timezone**: When using `--tz Asia/Shanghai`, the cron expression is in LOCAL time, not UTC. `40 23 * * *` means 23:40 Shanghai time. Do NOT convert to UTC yourself.
-2. **Dispatch must write snapshots**: The dispatch phase MUST use the `write` tool to create/overwrite `memory/groups/<chat_id>.md` files. Without this, Phase 3 has nothing to load.
-3. **Must use isolated agentTurn, NOT main systemEvent**: `timeoutSeconds` only works with `agentTurn` (isolated) jobs. Main session `systemEvent` jobs use a hardcoded ~120s heartbeat timeout that CANNOT be overridden. We learned this the hard way — our first two runs were killed at exactly 120s.
-4. **Timeout must be generous**: Set `--timeout-seconds 900` (15 min). Real-world pack with 6 sessions takes ~135s. Without enough timeout, the cron gets killed mid-execution and produces no output.
-5. **Parallel tool calls**: When pulling history from multiple sessions, batch `sessions_history` calls in parallel (same tool call block). Same for writing multiple snapshot files. This cuts execution time significantly.
-6. **Chat ID mapping**: Keep a mapping of group names → chat_ids in the dispatch instructions file or TOOLS.md. The dispatch agent needs this to send messages and write snapshot files.
-7. **Single schedule source**: Use `memory/schedule.md` (Markdown table) as the ONLY schedule/todo tracking file. Do not create separate JSON schedule files — they will diverge and cause confusion.
-8. **Header must be exact**: The daily summary section title must be exactly `## DeepSleep Daily Summary` — pack, dispatch, and failure recovery all use this string as the detection anchor. Any variation (Chinese translation, extra words) will cause dispatch to think pack failed and trigger unnecessary emergency recovery.
-9. **Chat_id annotation format**: Must be `<!-- chat:oc_xxx -->` (with space after `chat:`). Pack must self-check that every group section has this annotation. Missing annotation = that group gets no morning brief and no snapshot update.
-10. **Time perspective shift**: Pack runs at 23:40 (still "today"), but dispatch sends at 00:10 (already "tomorrow"). The morning brief must use the **reader's perspective**: summaries describe "what was done **yesterday**", action items describe "what to do **today**". Never write "today we did X / tomorrow do Y" — that's the pack-time perspective and feels wrong to the reader.
-11. **Midnight race condition**: Pack starts at 23:40 and may cross midnight. Lock the target date at script start (23:xx→today, 00:xx→yesterday) and never re-fetch current time in later steps. All filenames and headers use this locked `PACK_DATE`.
-12. **Dispatch deduplication**: Use `memory/dispatch-lock.md` (contains one line: the dispatched date). Check before sending; write after all sends complete. If lock date matches target date, skip entirely. Lock must be written AFTER sends (not before) so a crash mid-send allows retry.
-13. **Schedule ItemKey dedup**: `memory/schedule.md` has a `Key` column as unique identifier. Pack must check existing keys before writing; update status if key exists, only append if new.
-14. **Snapshot rolling merge with silent-day protection**: Keep last 3 days of **active** progress entries. Silent-day carry-forward entries (marked "延续自") are exempt from the 3-day window and persist until replaced by active content or their linked Open Questions / todos resolve. Open Questions and incomplete todos survive indefinitely. Completed todos older than 3 days are pruned.
-15. **MEMORY.md guard rails**: Pack may only append/update — never delete existing sections, rewrite About/Channels/Lessons, or restructure the file. Humans own the structure; agents own incremental updates.
-16. **DM privacy boundary**: Daily summary is broadcast material. DM content stays in MEMORY.md only. Open Questions and Today sections must not contain DM-originated items. Write "N DMs processed" summary, not details.
-17. **Silent Day Carry-Forward with Decay**: If no active sessions exist during pack, do NOT skip. Carry forward from the most recent active daily file (search back up to 7 days). Decay schedule: Days 1-3 = full carry (OQs + todos + actions + group markers); Days 4-7 = slim carry (OQs + todos only); Days 8-14 = minimal carry (OQs only, todos marked as "shelved"); Days 15+ = archive OQs to `MEMORY.md ## Open Questions (Archived)`, stop daily carry-forward and dispatch. This prevents both memory loss (short silence) and infinite zombie carry-forward (long silence). On resumption of activity, archived OQs are accessible via MEMORY.md in Phase 3.
-
-## Verification Checklist
-
-After setup, run this to verify everything works:
-
-```bash
-# 1. Manually trigger pack
-openclaw cron run <pack-job-id>
-
-# 2. Wait for completion (~2-3 min), then check:
-openclaw cron runs --id <pack-job-id> --limit 1
-# Expected: status=ok, durationMs > 120000 (proves timeout works)
-
-# 3. Check output files:
-cat memory/YYYY-MM-DD.md | grep "DeepSleep Daily Summary"
-# Expected: section exists with group summaries + chat_id annotations
-
-# 4. Manually trigger dispatch
-openclaw cron run <dispatch-job-id>
-
-# 5. Check dispatch output:
-ls -la memory/groups/
-# Expected: one .md file per active group, updated timestamp = now
-
-# 6. Check Feishu groups received morning briefs
-```
-
-If pack completes in exactly 120s → timeout is NOT working (you're using systemEvent instead of agentTurn). Recreate with `--session isolated`.
+1. **Cron timezone**: `--tz Asia/Shanghai` means cron expression is in LOCAL time. Don't convert to UTC.
+2. **Must use isolated agentTurn**: `systemEvent` ignores `timeoutSeconds` (hardcoded ~120s). Use `--session isolated`.
+3. **Timeout must be generous**: 900s (15 min). Real-world unified pack+dispatch with 8 sessions takes ~3-5 min.
+4. **Parallel tool calls**: Batch `sessions_history` and snapshot writes in parallel.
+5. **Chat ID in headers**: Every `### GroupName` MUST have `<!-- chat:oc_xxx -->`. Missing = group loses memory.
+6. **Header must be exact**: `## DeepSleep Daily Summary` — no variations.
+7. **dispatch_policy flag**: Pack MUST set `<!-- dispatch_policy: active|silent -->`. Dispatch reads this.
+8. **Time perspective**: Briefs use reader perspective: "yesterday did X / today do Y".
+9. **Midnight race**: Lock PACK_DATE at start, never re-fetch.
+10. **Dispatch dedup**: `dispatch-lock.md` written AFTER sends complete.
+11. **Schedule Key dedup**: Check existing keys before writing.
+12. **Silent Day Decay**: 4-tier (1-3d full / 4-7d slim / 8-14d minimal / 15+d archive).
+13. **MEMORY.md guard rails**: Append/update only. Never delete/restructure.
+14. **DM privacy**: Daily summary is broadcast; MEMORY.md is diary. Don't mix.
+15. **Importance tiers**: 🔴P0 retained 7d in snapshots, 🟡P1 5d, 🟢P2 3d.
+16. **OQ age tracking**: All OQs must have `[since: MM-DD, pending N days]` annotation.
+17. **Cross-group correlations**: Only mention topic keywords, never quote another group's conversations.
 
 ## Failure Recovery
 
-If Phase 1 (pack) fails or times out, Phase 2 (dispatch) has a built-in fallback: it detects the missing daily summary and performs an emergency mini-pack — pulling recent history from all active sessions, generating a condensed summary, then proceeding with normal dispatch. This ensures **no day's memory is ever lost**, even if a cron job fails.
+If pack fails or times out:
+- **Unified mode**: Dispatch won't run (same session). Next day's unified job will detect missing summary and do emergency mini-pack for the missed day.
+- **Manual recovery**: Run dispatch-instructions.md independently — it has built-in pack-failure detection and emergency mini-pack.
+
+## Verification Checklist
+
+```bash
+# 1. Manually trigger unified job
+openclaw cron run <job-id>
+
+# 2. Check completion
+openclaw cron runs --id <job-id> --limit 1
+# Expected: durationMs > 120000 (proves timeout works)
+
+# 3. Check pack output
+cat memory/YYYY-MM-DD.md | grep "DeepSleep Daily Summary"
+cat memory/YYYY-MM-DD.md | grep "dispatch_policy"
+cat memory/YYYY-MM-DD.md | grep "pack_version: 3.0"
+
+# 4. Check dispatch output
+ls -la memory/groups/
+# Expected: updated timestamps on group snapshot files
+
+# 5. Check dispatch log
+tail -20 memory/dispatch-log.md
+
+# 6. Check Feishu groups (only active groups should receive briefs)
+```
 
 ## Inspirations
 
